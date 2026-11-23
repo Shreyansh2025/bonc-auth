@@ -1,8 +1,4 @@
-"""HTTP client for the company-owned BONC token verification endpoint.
-
-This package does not issue tokens or decode unverified JWT claims. BONC's
-.NET endpoint is responsible for validating the token and current session.
-"""
+"""Shared client: forwards a user's bearer token to the BONC .NET verifier."""
 
 from collections.abc import Mapping
 from typing import Any
@@ -10,137 +6,97 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .exceptions import (
-    AuthServiceUnavailable,
-    InsufficientPermission,
-    InvalidToken,
-    InvalidVerificationResponse,
-)
-from .models import VerifiedUser
+
+class BoncAuthError(Exception):
+    """Base error for BONC authentication."""
+
+
+class InvalidToken(BoncAuthError):
+    """The token is missing, invalid, expired, or its session was revoked."""
+
+
+class Forbidden(BoncAuthError):
+    """The user is authenticated but does not have admin access."""
+
+
+class AuthServiceUnavailable(BoncAuthError):
+    """The BONC verification service could not safely verify the request."""
 
 
 def extract_bearer_token(authorization: str | None) -> str:
-    """Extract one well-formed Bearer token from an Authorization header."""
-    if not authorization:
-        raise InvalidToken("Missing Authorization: Bearer header.")
-
-    scheme, separator, token = authorization.partition(" ")
-    if (
-        not separator
-        or scheme.lower() != "bearer"
-        or not token
-        or token != token.strip()
-        or any(character.isspace() for character in token)
-    ):
-        raise InvalidToken("Malformed Authorization: Bearer header.")
-
-    return token
+    """Return a valid Bearer token or raise InvalidToken."""
+    parts = authorization.split() if authorization else []
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise InvalidToken("A valid Authorization: Bearer header is required.")
+    return parts[1]
 
 
 class BoncAuth:
-    """Verify incoming user tokens through the central BONC endpoint.
+    """Call the company-owned .NET endpoint to verify an admin token.
 
-    The endpoint's successful HTTP response is treated as proof that its
-    configured token and session checks passed. Field names are configurable;
-    defaults match the example contract discussed with the BONC team:
-    ``adminId``, ``role`` and ``sessionId``.
-
-    Args:
-        verify_url: Verification URL supplied by the BONC team.
-        service_headers: Optional additional server-to-server headers, if the
-            endpoint requires them. Never put frontend credentials here.
-        timeout: HTTP timeout in seconds.
-        method: HTTP method expected by the verification endpoint (GET/POST).
-        user_id_field: Response field containing the stable user/admin ID.
-        role_field: Response field containing a role string or list.
-        roles_field: Optional response field containing additional roles.
-        permissions_field: Response field containing permission strings.
-        session_id_field: Optional session ID response field.
-        active_field: Optional boolean response field. Set to None if the
-            endpoint uses HTTP 200 alone to indicate an active session.
-        require_https: Require HTTPS except for localhost during development.
+    The .NET endpoint must return HTTP 200 only when the JWT and active session
+    are valid. Its example response is {"adminId": "...", "role": "Admin",
+    "sessionId": "..."}. A 401 means invalid/revoked; a 403 means not admin.
     """
 
     def __init__(
         self,
         verify_url: str,
         *,
-        service_headers: Mapping[str, str] | None = None,
-        timeout: float = 3.0,
         method: str = "GET",
-        user_id_field: str = "adminId",
-        role_field: str = "role",
-        roles_field: str = "roles",
-        permissions_field: str = "permissions",
-        session_id_field: str = "sessionId",
-        active_field: str | None = "active",
-        require_https: bool = True,
+        timeout: float = 5.0,
+        service_headers: Mapping[str, str] | None = None,
     ) -> None:
-        if not isinstance(verify_url, str) or not verify_url.strip():
-            raise ValueError("verify_url must be a non-empty URL.")
-        parsed = urlparse(verify_url.strip())
-        local_hosts = {"localhost", "127.0.0.1", "::1"}
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        parsed = urlparse(verify_url)
+        if parsed.scheme not in {"https", "http"} or not parsed.netloc:
             raise ValueError("verify_url must be an absolute HTTP(S) URL.")
-        if require_https and parsed.scheme != "https" and parsed.hostname not in local_hosts:
-            raise ValueError("verify_url must use HTTPS outside localhost.")
+        if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("Use HTTPS for the BONC verification endpoint.")
+        if method.upper() not in {"GET", "POST"}:
+            raise ValueError("method must be GET or POST.")
         if timeout <= 0:
             raise ValueError("timeout must be greater than zero.")
+        if any(key.lower() == "authorization" for key in (service_headers or {})):
+            raise ValueError("Do not set Authorization in service_headers.")
 
-        normalized_method = method.upper()
-        if normalized_method not in {"GET", "POST"}:
-            raise ValueError("method must be GET or POST.")
-
-        headers = dict(service_headers or {})
-        if any(key.lower() == "authorization" for key in headers):
-            raise ValueError(
-                "Do not set Authorization in service_headers; the user's Bearer "
-                "token is sent there. Configure any separate service-auth header instead."
-            )
-
-        self.verify_url = verify_url.strip()
-        self.service_headers = headers
+        self.verify_url = verify_url
+        self.method = method.upper()
         self.timeout = timeout
-        self.method = normalized_method
-        self.response_fields = {
-            "user_id_field": user_id_field,
-            "role_field": role_field,
-            "roles_field": roles_field,
-            "permissions_field": permissions_field,
-            "session_id_field": session_id_field,
-            "active_field": active_field,
-        }
+        self.service_headers = dict(service_headers or {})
 
     def _headers(self, token: str) -> dict[str, str]:
         return {
-            "Accept": "application/json",
             **self.service_headers,
+            "Accept": "application/json",
             "Authorization": f"Bearer {token}",
         }
 
-    def _parse_response(self, response: httpx.Response) -> VerifiedUser:
+    @staticmethod
+    def _read_response(response: httpx.Response) -> dict[str, Any]:
         if response.status_code == 401:
-            raise InvalidToken("BONC rejected the token or the session is inactive.")
+            raise InvalidToken("Token is invalid, expired, or the session is no longer active.")
         if response.status_code == 403:
-            raise InsufficientPermission("BONC denied access to the verification request.")
+            raise Forbidden("Admin access is required.")
         if response.status_code != 200:
             raise AuthServiceUnavailable(
-                f"BONC verification service returned HTTP {response.status_code}."
+                f"BONC verification returned HTTP {response.status_code}."
             )
 
         try:
-            payload: Any = response.json()
+            data = response.json()
         except ValueError as exc:
-            raise InvalidVerificationResponse(
-                "BONC verification service did not return valid JSON."
-            ) from exc
+            raise AuthServiceUnavailable("BONC returned an invalid JSON response.") from exc
 
-        return VerifiedUser.from_response(payload, **self.response_fields)
+        if not isinstance(data, dict) or not data.get("adminId"):
+            raise AuthServiceUnavailable(
+                "BONC response must be a JSON object containing adminId."
+            )
+        return data
 
-    def verify_token(self, token: str) -> VerifiedUser:
-        """Verify a token synchronously (for Flask and synchronous callers)."""
+    def verify(self, token: str) -> dict[str, Any]:
+        """Verify a token synchronously (used by Flask)."""
         if not token:
-            raise InvalidToken("Empty bearer token.")
+            raise InvalidToken("Bearer token is empty.")
         try:
             response = httpx.request(
                 self.method,
@@ -150,15 +106,13 @@ class BoncAuth:
                 follow_redirects=False,
             )
         except httpx.RequestError as exc:
-            raise AuthServiceUnavailable(
-                "Could not reach the BONC verification service."
-            ) from exc
-        return self._parse_response(response)
+            raise AuthServiceUnavailable("Could not reach BONC authentication service.") from exc
+        return self._read_response(response)
 
-    async def verify_token_async(self, token: str) -> VerifiedUser:
-        """Verify a token asynchronously (for FastAPI)."""
+    async def verify_async(self, token: str) -> dict[str, Any]:
+        """Verify a token asynchronously (used by FastAPI)."""
         if not token:
-            raise InvalidToken("Empty bearer token.")
+            raise InvalidToken("Bearer token is empty.")
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout,
@@ -170,17 +124,5 @@ class BoncAuth:
                     headers=self._headers(token),
                 )
         except httpx.RequestError as exc:
-            raise AuthServiceUnavailable(
-                "Could not reach the BONC verification service."
-            ) from exc
-        return self._parse_response(response)
-
-    def authenticate_header(self, authorization: str | None) -> VerifiedUser:
-        """Extract and verify a bearer token from a request header."""
-        return self.verify_token(extract_bearer_token(authorization))
-
-    async def authenticate_header_async(
-        self, authorization: str | None
-    ) -> VerifiedUser:
-        """Asynchronously extract and verify a bearer token from a request header."""
-        return await self.verify_token_async(extract_bearer_token(authorization))
+            raise AuthServiceUnavailable("Could not reach BONC authentication service.") from exc
+        return self._read_response(response)

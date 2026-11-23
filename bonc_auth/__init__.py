@@ -1,23 +1,19 @@
-"""Reusable BONC authentication integrations."""
+"""Simple reusable BONC authentication helpers."""
 
-from .client import BoncAuth
-from .exceptions import (
+from .client import (
     AuthServiceUnavailable,
+    BoncAuth,
     BoncAuthError,
-    InsufficientPermission,
+    Forbidden,
     InvalidToken,
-    InvalidVerificationResponse,
 )
-from .models import VerifiedUser
 
 __all__ = [
     "BoncAuth",
-    "VerifiedUser",
     "BoncAuthError",
     "InvalidToken",
-    "InsufficientPermission",
+    "Forbidden",
     "AuthServiceUnavailable",
-    "InvalidVerificationResponse",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

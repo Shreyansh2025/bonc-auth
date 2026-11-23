@@ -4,12 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bonc-auth"
-version = "0.1.0"
-description = "Reusable BONC authentication integrations for Flask and FastAPI"
+version = "0.2.0"
+description = "Simple BONC admin authentication integrations for Flask and FastAPI"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "LicenseRef-Proprietary"
-authors = [{ name = "BONC Auth Contributors" }]
 dependencies = ["httpx>=0.27,<1"]
 
 [project.optional-dependencies]

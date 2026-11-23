@@ -1,159 +1,101 @@
 # bonc-auth
 
-A small reusable Python package for Flask and FastAPI services that need to verify a user's BONC bearer token through the company-owned .NET verification endpoint.
+A small Python package for protecting admin APIs in Flask and FastAPI projects using the company's .NET verification endpoint.
 
-**This package does not create JWTs, implement login/logout, or connect to SQL Server.** BONC's .NET backend remains responsible for validating the token and checking the user's active session.
+**This package does not create JWTs, implement login/logout, or connect to SQL Server.** The .NET backend verifies the token and checks whether its session is still active.
 
-## Current status
+## Expected .NET endpoint behavior
 
-- Initial package version: `0.1.0`
-- Flask Blueprint integration: included
-- FastAPI dependency integration: included
-- Real BONC endpoint contract: not yet confirmed; configure it before connecting a real environment
-
-## Install from GitHub
-
-Flask only:
-
-```bash
-pip install "bonc-auth[flask] @ git+https://github.com/Shreyansh2025/bonc-auth.git@main"
-```
-
-FastAPI only:
-
-```bash
-pip install "bonc-auth[fastapi] @ git+https://github.com/Shreyansh2025/bonc-auth.git@main"
-```
-
-Both integrations:
-
-```bash
-pip install "bonc-auth[all] @ git+https://github.com/Shreyansh2025/bonc-auth.git@main"
-```
-
-After creating a release tag, use that tag (for example `@v0.1.0`) instead of `@main` so projects remain pinned to a known version.
-
-## Verification endpoint contract
-
-The package forwards the incoming user token to the configured verification endpoint in the `Authorization` header. The default method is GET, matching the example discussed with the team. POST is also configurable.
-
-Example request:
+The package forwards the frontend's token to the verification endpoint:
 
 ```http
 GET /api/auth/verify-admin
 Authorization: Bearer <user-access-token>
-Accept: application/json
 ```
 
-The example endpoint from the discussion returns an authenticated user on HTTP 200:
+Expected response from the example discussed with the BONC team:
 
 ```json
 {
-  "adminId": "stable-user-id",
+  "adminId": "stable-admin-id",
   "role": "Admin",
   "sessionId": "active-session-id"
 }
 ```
 
-Expected status handling:
+- HTTP 200: token and active session accepted; response must contain `adminId`.
+- HTTP 401: token invalid, expired, or session logged out/revoked.
+- HTTP 403: user is authenticated but does not have admin access.
+- Timeout, connection error, unexpected status, or invalid response: the Python API fails closed with HTTP 503.
 
-- `200`: token and session accepted; response must contain the configured user ID field.
-- `401`: invalid, expired, or revoked token/session.
-- `403`: verification endpoint denied access.
-- Any other status, timeout, malformed JSON, or connection error: fail closed with HTTP 503 from the protected Python API.
+The company still needs to confirm the real endpoint URL, method, response shape and any service-to-service authentication. The example above is not yet a verified production contract.
 
-The response field names are configurable. If BONC instead returns `user_id`, `roles`, `permissions`, or an `active` field, configure `BoncAuth` accordingly. Ask the company to confirm the endpoint URL, method, response schema and service-to-service protection before production use.
+## Install
 
-If the verification endpoint requires a separate service credential, pass it using `service_headers`. Do not put the caller's user token there; the package uses the `Authorization` header for the user's token. Keep service credentials on the backend only (environment variables or a secret manager), never in frontend code.
+Flask:
 
-## Flask usage
+```bash
+pip install "bonc-auth[flask] @ git+https://github.com/Shreyansh2025/bonc-auth.git@v0.2.0"
+```
 
-Attach the guard to an admin Blueprint once:
+FastAPI:
+
+```bash
+pip install "bonc-auth[fastapi] @ git+https://github.com/Shreyansh2025/bonc-auth.git@v0.2.0"
+```
+
+## Flask example
 
 ```python
 import os
 from flask import Blueprint, g, jsonify
 from bonc_auth import BoncAuth
-from bonc_auth.flask import FlaskBoncAuth
+from bonc_auth.flask import AdminGuard
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
-
-bonc_client = BoncAuth(
-    verify_url=os.environ["BONC_AUTH_VERIFY_URL"],
-    method=os.getenv("BONC_AUTH_VERIFY_METHOD", "GET"),
-    timeout=3.0,
-    # Defaults match the example .NET response: adminId, role, sessionId.
-)
-admin_auth = FlaskBoncAuth(bonc_client)
-admin_auth.protect_blueprint(admin_bp, required_role="Admin")
+auth = BoncAuth(os.environ["BONC_AUTH_VERIFY_URL"])
+AdminGuard(auth).protect_blueprint(admin_bp)
 
 @admin_bp.get("/me")
 def me():
-    return jsonify({"admin_id": g.bonc_user.user_id})
+    return jsonify({"admin_id": g.admin["adminId"]})
 ```
 
-For one route requiring an additional permission:
-
-```python
-@admin_bp.post("/moderation/approve")
-@admin_auth.require_permission("moderation.write")
-def approve_content():
-    return {"status": "ok"}
-```
-
-Register the Blueprint after attaching the guard. OPTIONS preflight requests are allowed by default; CORS must still be configured correctly in the application.
-
-## FastAPI usage
+## FastAPI example
 
 ```python
 import os
-from fastapi import APIRouter, Depends
+from fastapi import Depends, FastAPI
 from bonc_auth import BoncAuth
-from bonc_auth.fastapi import FastAPIBoncAuth
+from bonc_auth.fastapi import FastAPIAdminGuard
 
-router = APIRouter()
-bonc_client = BoncAuth(
-    verify_url=os.environ["BONC_AUTH_VERIFY_URL"],
-    method=os.getenv("BONC_AUTH_VERIFY_METHOD", "GET"),
-    timeout=3.0,
-)
-bonc_auth = FastAPIBoncAuth(bonc_client)
+app = FastAPI()
+auth = BoncAuth(os.environ["BONC_AUTH_VERIFY_URL"])
+guard = FastAPIAdminGuard(auth)
 
-@router.get("/admin/me")
-async def me(user=Depends(bonc_auth.require_role("Admin"))):
-    return {"admin_id": user.user_id}
-
-@router.get("/admin/audit")
-async def read_audit(user=Depends(bonc_auth.require_permission("moderation.read"))):
-    return {"requested_by": user.user_id}
+@app.get("/api/admin/me")
+async def me(admin=Depends(guard.require_admin)):
+    return {"admin_id": admin["adminId"]}
 ```
 
-## Security behavior
-
-- No local JWT decoding: the trusted .NET endpoint must verify signature, issuer, audience, expiry and active session.
-- HTTPS is required by default except for localhost development.
-- Redirects are not followed when sending the user's token to the verifier.
-- Invalid tokens return 401; insufficient permissions return 403; unavailable or malformed verifier responses return 503.
-- The package fails closed. It never grants access when the verifier is unreachable.
-- User tokens and secrets are not written to logs.
-- Every protected application endpoint must still enforce its required role or permission.
-
-## Develop, test and build
+## Build and test
 
 ```bash
-python -m venv .venv
-# Activate the virtual environment, then:
 python -m pip install -e ".[dev]"
 pytest
 python -m build
 ```
 
-The build creates a wheel and source distribution under `dist/`.
+The build creates a wheel and source archive in `dist/`.
 
-## Python package hosting
+## Use in other projects
 
-GitHub Packages does not currently list a Python/PyPI-compatible registry. Keep the source code in this GitHub repository and install it from a tag, or publish the Python distribution to PyPI (or an approved private Python package index). PyPI Trusted Publishing can publish from GitHub Actions without a long-lived PyPI API token, after a trusted publisher is configured and the team approves the release process.
+The GitHub repository itself can be used as the package source. Install from a version tag as shown above. GitHub Packages does not currently provide a Python package registry; PyPI or a private Python package index is an optional later publishing step.
 
-## License and internal use
+## Security
 
-This package is intended for the BONC projects agreed by the maintainers. Confirm the repository visibility and licensing with the company before distributing it outside those projects.
+- Use HTTPS for the verification endpoint.
+- Keep any service-to-service credentials on the backend only.
+- Never log or store the user's bearer token unnecessarily.
+- Do not allow access when the verification service is unavailable.
+- Protect only the admin routes that require authentication; register public routes on a separate Blueprint/router.
